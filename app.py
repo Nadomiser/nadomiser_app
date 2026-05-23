@@ -17,6 +17,9 @@ img_dir = Path("genshin_characters")
 enemies_list = "enemies.yaml"
 route_link = "https://qiqis-notebook.com/route/67a4b07f77537e1c51dc1f54"
 
+# Always 4 character columns regardless of team size
+HISTORY_COLS = ['Character1', 'Character2', 'Character3', 'Character4', 'LL/Weekly', 'Boss #']
+
 
 # ── Session state init ───────────────────────────────────────────────────────
 
@@ -42,9 +45,7 @@ if "team_size" not in ss:
     ss.team_size = 4
 
 if "character_use_df" not in ss:
-    ss.character_use_df = pd.DataFrame(
-        columns=[f'Character{i+1}' for i in range(ss.team_size)] + ['LL/Weekly', 'Boss #']
-    )
+    ss.character_use_df = pd.DataFrame(columns=HISTORY_COLS)
 
 if "config" not in ss:
     with open(enemies_list, 'r') as f:
@@ -113,15 +114,15 @@ def get_eligible_characters():
     ]
 
 
-def rebuild_use_df_columns():
-    new_cols = [f'Character{i+1}' for i in range(ss.team_size)] + ['LL/Weekly', 'Boss #']
-    if list(ss.character_use_df.columns) == new_cols:
-        return
-    old_df = ss.character_use_df.copy()
-    new_df = pd.DataFrame(columns=new_cols)
-    for _, row in old_df.iterrows():
-        new_df.loc[len(new_df)] = {col: row[col] if col in row else "" for col in new_cols}
-    ss.character_use_df = new_df
+# def rebuild_use_df_columns():
+#     new_cols = [f'Character{i+1}' for i in range(ss.team_size)] + ['LL/Weekly', 'Boss #']
+#     if list(ss.character_use_df.columns) == new_cols:
+#         return
+#     old_df = ss.character_use_df.copy()
+#     new_df = pd.DataFrame(columns=new_cols)
+#     for _, row in old_df.iterrows():
+#         new_df.loc[len(new_df)] = {col: row[col] if col in row else "" for col in new_cols}
+#     ss.character_use_df = new_df
 
 
 def generate_random_team(exclude_team=None):
@@ -140,9 +141,29 @@ def generate_random_team(exclude_team=None):
     return selected
 
 
+def rebuild_use_counts_from_table():
+    """Rebuild character_use_count entirely from the team history table."""
+    counts = {c: 0 for c in ss.character_use_count}
+    char_cols = ['Character1', 'Character2', 'Character3', 'Character4']
+    for col in char_cols:
+        if col in ss.character_use_df.columns:
+            for val in ss.character_use_df[col]:
+                if pd.notna(val) and str(val).strip():
+                    name = str(val).strip()
+                    if name in counts:
+                        counts[name] += 1
+    ss.character_use_count = counts
+
+
 def record_team(team, enemy="", boss_num=None):
-    row = [c.title() for c in team] + [enemy, boss_num if boss_num else ""]
+    # Always 4 character columns — pad with empty string if team is smaller
+    chars = [c.title() for c in team]
+    while len(chars) < 4:
+        chars.append("")
+    row = chars + [enemy, boss_num if boss_num else ""]
     ss.character_use_df.loc[len(ss.character_use_df)] = row
+    # Rebuild counts from the full table to stay in sync
+    rebuild_use_counts_from_table()
 
 
 def push_team_history(team):
@@ -165,7 +186,7 @@ def apply_filters_to_char_selected(new_filters):
             ss.char_selected[name] = True
 
 
-# ── Timer (uses st.html, no deprecated components.html) ─────────────────────
+# ── Timer
 
 @st.fragment(run_every=0.1)
 def timer():
@@ -222,13 +243,8 @@ def timer():
             st.session_state.elapsed = 0
 
 
-# ── Layout: left column (all content) | right column (map) ───────────────────
 
 left, right = st.columns([1, 1])
-
-with right:
-    st.subheader("🗺 Qiqi's Notebook Route")
-    st.iframe(route_link, height=1180)
 
 with left:
 
@@ -239,20 +255,18 @@ with left:
     with r1b:
         st.markdown("**Team size**")
         new_team_size = st.number_input(
-            "Characters", min_value=1, max_value=10,
+            "Characters", min_value=1, max_value=4,
             value=ss.team_size, step=1,
             key="team_size_input", label_visibility="collapsed"
         )
         if st.button("Apply", use_container_width=True, key="apply_team_size"):
             if new_team_size != ss.team_size:
                 ss.team_size = new_team_size
-                rebuild_use_df_columns()
-                eligible = get_eligible_characters()
-                pool = eligible if len(eligible) >= ss.team_size else list(ss.character_use_count.keys())
-                ss.team = random.sample(pool, ss.team_size)
-                ss.team_history = [ss.team]
-                ss.team_history_idx = 0
-                ss.pending_team_staged = None
+                new_team = generate_random_team()
+                push_team_history(new_team)
+                ss.team = new_team
+                ss.pending_team_staged = new_team if ss.pending_boss else None
+                st.toast(f"Team size changed to {new_team_size} — new team rolled!")
                 st.rerun()
 
     st.divider()
@@ -430,9 +444,78 @@ with left:
     if ss.character_use_df.empty:
         st.caption("No teams recorded yet.")
     else:
-        st.dataframe(ss.character_use_df, use_container_width=True)
+        display_df = ss.character_use_df.copy()
+        display_df.index = display_df.index + 1  # 1-based display
+        st.dataframe(display_df, use_container_width=True)
+
+        with st.expander("🗑 Delete Rows from History"):
+            row_labels = [
+                f"Row {i+1} — {' | '.join(str(v) for v in ss.character_use_df.iloc[i] if pd.notna(v) and str(v).strip())}"
+                for i in range(len(ss.character_use_df))
+            ]
+            rows_to_delete = st.multiselect(
+                "Select rows to delete:",
+                options=list(range(len(ss.character_use_df))),
+                format_func=lambda i: row_labels[i],
+                key="rows_to_delete_select"
+            )
+            if st.button("🗑 Delete Selected & Rebuild Counts", disabled=not rows_to_delete,
+                         type="primary", use_container_width=True):
+                ss.character_use_df = (
+                    ss.character_use_df.drop(index=rows_to_delete).reset_index(drop=True)
+                )
+                rebuild_use_counts_from_table()
+                st.toast(f"Deleted {len(rows_to_delete)} row(s) — use counts rebuilt.")
+                st.rerun()
 
     st.divider()
+
+    # ── Import Team History ───────────────────────────────────────────────────
+    st.subheader("📥 Import Team History")
+    with st.expander("Import from CSV / Excel to continue an older run"):
+        st.caption(
+            f"File must contain exactly these columns: `{'`, `'.join(HISTORY_COLS)}`"
+        )
+        uploaded_history = st.file_uploader(
+            "Upload team history file", type=["csv", "xlsx"],
+            key="history_upload"
+        )
+        if uploaded_history is not None:
+            try:
+                if uploaded_history.name.endswith(".csv"):
+                    imported_df = pd.read_csv(uploaded_history)
+                else:
+                    imported_df = pd.read_excel(uploaded_history)
+
+                missing_cols = [c for c in HISTORY_COLS if c not in imported_df.columns]
+                if missing_cols:
+                    st.error(
+                        f"The uploaded file is missing the following required column(s): "
+                        f"**{', '.join(missing_cols)}**. "
+                        f"All six columns are required: {', '.join(HISTORY_COLS)}."
+                    )
+                else:
+                    imported_df = imported_df[HISTORY_COLS].reset_index(drop=True)
+                    st.success(f"File looks valid — {len(imported_df)} row(s) found.")
+                    st.dataframe(imported_df, use_container_width=True)
+                    if st.button("✅ Confirm Import & Rebuild Counts",
+                                 type="primary", use_container_width=True):
+                        ss.character_use_df = imported_df
+                        rebuild_use_counts_from_table()
+                        # Restore boss counter from the imported table
+                        numeric_bosses = pd.to_numeric(
+                            imported_df['Boss #'], errors='coerce'
+                        ).dropna()
+                        ss.boss_counter = int(numeric_bosses.max()) if not numeric_bosses.empty else 0
+                        st.toast("Team history imported and use counts rebuilt!")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Could not read the uploaded file: {e}")
+
+with right:
+    st.subheader("🗺 Route")
+    with st.expander("Qiqi's Notebook Map") :
+        st.iframe(route_link, height=1180)
 
     # ── Boss Wheel ───────────────────────────────────────────────────────────
     st.subheader("🎡 LL/Weekly Boss Selector")
